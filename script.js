@@ -33,7 +33,13 @@ const MIC_AUDIO_CONSTRAINTS = {
     noiseSuppression: false,
     autoGainControl: false,
 };
-const SPECTROGRAM_GAIN = 2.0;
+const SPECTROGRAM_GAIN = 2.5;
+
+const nativeGetUserMedia =
+    navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function'
+        ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
+        : null;
+let getUserMediaPatched = false;
 
 let recordingInProgress = false;
 let recordingIntervalId = null;
@@ -57,13 +63,164 @@ async function getMicrophoneStream() {
     }
 }
 
+function patchGetUserMediaForRawAudio() {
+    if (getUserMediaPatched) return;
+    if (!nativeGetUserMedia || !navigator.mediaDevices) return;
+
+    navigator.mediaDevices.getUserMedia = async (constraints = {}) => {
+        if (!constraints || !constraints.audio) {
+            return nativeGetUserMedia(constraints);
+        }
+
+        const requestedAudio = constraints.audio;
+        const requestedAudioObj =
+            requestedAudio === true ? {} :
+            requestedAudio && typeof requestedAudio === 'object' ? requestedAudio :
+            {};
+
+        const shouldApplySoftwareGain =
+            requestedAudio === true ||
+            (
+                !('echoCancellation' in requestedAudioObj) &&
+                !('noiseSuppression' in requestedAudioObj) &&
+                !('autoGainControl' in requestedAudioObj)
+            );
+
+        const mergedConstraints = {
+            ...constraints,
+            audio: {
+                ...requestedAudioObj,
+                ...MIC_AUDIO_CONSTRAINTS,
+            },
+        };
+
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        const canApplyGain = shouldApplySoftwareGain && AudioContextCtor;
+        const preampContext = canApplyGain ? new AudioContextCtor() : null;
+        const preampResumePromise = preampContext && preampContext.state === 'suspended'
+            ? preampContext.resume().catch(() => {})
+            : Promise.resolve();
+
+        let rawStream;
+        try {
+            rawStream = await nativeGetUserMedia(mergedConstraints);
+        } catch (_) {
+            if (preampContext) {
+                try {
+                    await preampContext.close();
+                } catch (_) {
+                    // ignore
+                }
+            }
+            return nativeGetUserMedia(constraints);
+        }
+
+        if (!preampContext) return rawStream;
+        await preampResumePromise;
+
+        const source = preampContext.createMediaStreamSource(rawStream);
+        const gainNode = preampContext.createGain();
+        gainNode.gain.value = SPECTROGRAM_GAIN;
+        const destination = preampContext.createMediaStreamDestination();
+
+        source.connect(gainNode);
+        gainNode.connect(destination);
+
+        const boostedStream = destination.stream;
+        let cleanedUp = false;
+        const cleanup = async () => {
+            if (cleanedUp) return;
+            cleanedUp = true;
+
+            try {
+                rawStream.getTracks().forEach(track => track.stop());
+            } catch (_) {
+                // ignore
+            }
+
+            try {
+                await preampContext.close();
+            } catch (_) {
+                // ignore
+            }
+        };
+
+        boostedStream.getTracks().forEach(track => {
+            track.addEventListener('ended', cleanup, { once: true });
+        });
+        rawStream.getTracks().forEach(track => {
+            track.addEventListener('ended', cleanup, { once: true });
+        });
+
+        return boostedStream;
+    };
+
+    getUserMediaPatched = true;
+}
+
+function getSpeechCommandsAudioContext(recognizer) {
+    if (!recognizer) return null;
+    try {
+        if (typeof recognizer.audioContext === 'function') return recognizer.audioContext();
+        if (recognizer.audioContext) return recognizer.audioContext;
+    } catch (_) {
+        // ignore
+    }
+
+    if (recognizer._audioContext) return recognizer._audioContext;
+    if (recognizer.context) return recognizer.context;
+
+    try {
+        for (const key of Object.keys(recognizer)) {
+            const value = recognizer[key];
+            if (!value) continue;
+            if (typeof value.resume === 'function' && typeof value.state === 'string') return value;
+            if (
+                value.audioContext &&
+                typeof value.audioContext.resume === 'function' &&
+                typeof value.audioContext.state === 'string'
+            ) {
+                return value.audioContext;
+            }
+        }
+    } catch (_) {
+        // ignore
+    }
+    return null;
+}
+
+function resumeAudioContextIfSuspended(audioContext) {
+    if (!audioContext || typeof audioContext.resume !== 'function') return Promise.resolve();
+    if (audioContext.state !== 'suspended') return Promise.resolve();
+    try {
+        return audioContext.resume().catch(() => {});
+    } catch (_) {
+        return Promise.resolve();
+    }
+}
+
 async function app() {
     startBtn.disabled = true;
 
     // --- DEIN MIKROFON-FIX (UNVERÄNDERT) ---
+    patchGetUserMediaForRawAudio();
+
+    let recognizerResumePromise = Promise.resolve();
+    try {
+        baseRecognizer = speechCommands.create('BROWSER_FFT');
+        recognizerResumePromise = resumeAudioContextIfSuspended(getSpeechCommandsAudioContext(baseRecognizer));
+    } catch (err) {
+        statusDiv.innerText = "Fehler beim Initialisieren: " + err.message;
+        startBtn.disabled = false;
+        return;
+    }
+
     try {
         statusDiv.innerText = "Frage Mikrofon an (Android Fix)...";
-        const stream = await getMicrophoneStream();
+        const streamPromise = nativeGetUserMedia
+            ? nativeGetUserMedia({ audio: MIC_AUDIO_CONSTRAINTS })
+            : navigator.mediaDevices.getUserMedia({ audio: MIC_AUDIO_CONSTRAINTS });
+        const stream = await streamPromise;
         stream.getTracks().forEach(track => track.stop()); 
         log("Mikrofon-Check erfolgreich.");
     } catch (err) {
@@ -77,7 +234,7 @@ async function app() {
     // 2. TensorFlow Basis-Modell laden
     try {
         statusDiv.innerText = "Lade Basis-KI...";
-        baseRecognizer = speechCommands.create('BROWSER_FFT');
+        await recognizerResumePromise;
         await baseRecognizer.ensureModelLoaded();
         
         // Erstelle den Transfer-Recognizer (Leeres Modell zum Befüllen)
@@ -287,9 +444,10 @@ async function startSpectrogram() {
     const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextCtor) return null;
 
-    const stream = await getMicrophoneStream();
     const audioContext = new AudioContextCtor();
-    await audioContext.resume();
+    const resumePromise = resumeAudioContextIfSuspended(audioContext);
+    const stream = await getMicrophoneStream();
+    await resumePromise;
 
     const source = audioContext.createMediaStreamSource(stream);
     const gainNode = audioContext.createGain();
