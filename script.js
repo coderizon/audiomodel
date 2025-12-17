@@ -28,8 +28,6 @@ let count1 = 0;
 let count2 = 0;
 
 const NOISE_LABEL = '_background_noise_';
-const NOISE_RECORDING_SECONDS = 20;
-const NOISE_EXAMPLES = 20; // 20 Sekunden => 20 Trainingsbeispiele
 
 let recordingInProgress = false;
 let recordingIntervalId = null;
@@ -384,64 +382,6 @@ async function collect(label) {
     }
 }
 
-async function collectNoiseTimed20s() {
-    if (!transferRecognizer) return;
-    if (recordingInProgress) return;
-
-    recordingInProgress = true;
-    stopAnyLiveListening();
-    enterRecordingUiState();
-
-    const totalMs = NOISE_RECORDING_SECONDS * 1000;
-    const startedAt = performance.now();
-
-    recordingTitle.innerText = `Aufnahme: Hintergrund (${NOISE_RECORDING_SECONDS}s)`;
-    recordingUi.style.display = 'block';
-    updateRecordingProgress(0, totalMs);
-
-    noiseBtn.innerText = `Aufnahme läuft... (0/${NOISE_EXAMPLES})`;
-    statusDiv.innerText = "Nehme Hintergrund auf...";
-
-    recordingIntervalId = window.setInterval(() => {
-        updateRecordingProgress(performance.now() - startedAt, totalMs);
-    }, 100);
-
-    try {
-        try {
-            spectrogramController = await startSpectrogram();
-        } catch (e) {
-            log("Spectrogram konnte nicht gestartet werden: " + e.message);
-        }
-
-        for (let i = 0; i < NOISE_EXAMPLES; i++) {
-            noiseBtn.innerText = `Aufnahme läuft... (${i + 1}/${NOISE_EXAMPLES})`;
-            await transferRecognizer.collectExample(NOISE_LABEL);
-
-            const targetMs = (i + 1) * 1000;
-            const elapsedMs = performance.now() - startedAt;
-            if (elapsedMs < targetMs) {
-                await sleep(targetMs - elapsedMs);
-            }
-        }
-
-        updateCounts();
-        statusDiv.innerText = `Hintergrund fertig (${NOISE_EXAMPLES} Beispiele).`;
-    } catch (e) {
-        statusDiv.innerText = "Aufnahme-Fehler: " + e.message;
-    } finally {
-        await stopSpectrogram(spectrogramController);
-        spectrogramController = null;
-
-        if (recordingIntervalId) {
-            window.clearInterval(recordingIntervalId);
-            recordingIntervalId = null;
-        }
-        updateRecordingProgress(totalMs, totalMs);
-        recordingInProgress = false;
-        exitRecordingUiState();
-    }
-}
-
 function updateCounts() {
     // Zählt wie viele Beispiele wir für jedes Label haben
     const counts = transferRecognizer.countExamples();
@@ -463,7 +403,7 @@ function updateCounts() {
 }
 
 // Event Listener für die Sammel-Buttons
-noiseBtn.addEventListener('click', collectNoiseTimed20s);
+noiseBtn.addEventListener('click', () => collect(NOISE_LABEL));
 // Wir mappen die Buttons auf feste interne Label-Namen
 class1Btn.addEventListener('click', () => collect('wort1'));
 class2Btn.addEventListener('click', () => collect('wort2'));
