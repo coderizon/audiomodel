@@ -72,6 +72,12 @@
     background: rgba(0, 0, 0, 0.7);
 }
 
+.timeline-marker.pulse {
+    width: 4px;
+    background: #fff;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.7);
+}
+
 .spectrogram {
     display: block;
     width: 100%;

@@ -242,6 +242,24 @@ function drawModelSpectrogram(spectrogram) {
     );
 }
 
+let timelinePulseTimeoutId = null;
+
+function pulseTimelineMarker() {
+    if (!timelineMarker) return;
+
+    timelineMarker.classList.add('pulse');
+    if (timelinePulseTimeoutId) window.clearTimeout(timelinePulseTimeoutId);
+    timelinePulseTimeoutId = window.setTimeout(() => {
+        timelineMarker.classList.remove('pulse');
+        timelinePulseTimeoutId = null;
+    }, 140);
+}
+
+function markSpectrogramBoundary(controller, frames = 8) {
+    if (!controller) return;
+    controller.boundaryFramesLeft = Math.max(controller.boundaryFramesLeft || 0, frames);
+}
+
 async function startSpectrogram() {
     if (!spectrogramCanvas) return null;
 
@@ -276,6 +294,7 @@ async function startSpectrogram() {
         canvasCtx,
         column,
         rafId: null,
+        boundaryFramesLeft: 0,
         running: true,
     };
 
@@ -286,16 +305,27 @@ async function startSpectrogram() {
         canvasCtx.drawImage(spectrogramCanvas, -1, 0);
 
         const height = spectrogramCanvas.height;
-        const bins = frequencyData.length;
-        for (let y = 0; y < height; y++) {
-            const bin = Math.floor((y / height) * bins);
-            const amplitude = frequencyData[bins - 1 - bin];
-            const [r, g, b] = amplitudeToRgb(amplitude);
-            const idx = y * 4;
-            column.data[idx] = r;
-            column.data[idx + 1] = g;
-            column.data[idx + 2] = b;
-            column.data[idx + 3] = 255;
+        if (controller.boundaryFramesLeft > 0) {
+            for (let y = 0; y < height; y++) {
+                const idx = y * 4;
+                column.data[idx] = 255;
+                column.data[idx + 1] = 255;
+                column.data[idx + 2] = 255;
+                column.data[idx + 3] = 255;
+            }
+            controller.boundaryFramesLeft -= 1;
+        } else {
+            const bins = frequencyData.length;
+            for (let y = 0; y < height; y++) {
+                const bin = Math.floor((y / height) * bins);
+                const amplitude = frequencyData[bins - 1 - bin];
+                const [r, g, b] = amplitudeToRgb(amplitude);
+                const idx = y * 4;
+                column.data[idx] = r;
+                column.data[idx + 1] = g;
+                column.data[idx + 2] = b;
+                column.data[idx + 3] = 255;
+            }
         }
 
         canvasCtx.putImageData(column, spectrogramCanvas.width - 1, 0);
@@ -382,6 +412,82 @@ async function collect(label) {
     }
 }
 
+async function collectBurst(label, labelUi, totalExamples, buttonEl) {
+    if (!transferRecognizer) return;
+    if (recordingInProgress) return;
+
+    recordingInProgress = true;
+    stopAnyLiveListening();
+    enterRecordingUiState();
+
+    const totalMs = totalExamples * 1000;
+    const startedAt = performance.now();
+
+    recordingTitle.innerText = `Aufnahme: ${labelUi} (${totalExamples}x)`;
+    recordingUi.style.display = 'block';
+    updateRecordingProgress(0, totalMs);
+
+    const originalButtonText = buttonEl ? buttonEl.innerText : null;
+    if (buttonEl) buttonEl.innerText = `Aufnahme läuft... (0/${totalExamples})`;
+    statusDiv.innerText = `Nehme auf: "${labelUi}" (0/${totalExamples})`;
+
+    recordingIntervalId = window.setInterval(() => {
+        const elapsedMs = performance.now() - startedAt;
+        updateRecordingProgress(elapsedMs, totalMs);
+
+        const secondIndex = Math.min(totalExamples, Math.floor(elapsedMs / 1000) + 1);
+        const withinSecondMs = elapsedMs % 1000;
+        const remainingSec = Math.max(0, (1000 - withinSecondMs) / 1000);
+        recordingTime.innerText = `Sekunde ${secondIndex}/${totalExamples} • ${remainingSec.toFixed(1)}s`;
+    }, 100);
+
+    try {
+        try {
+            spectrogramController = await startSpectrogram();
+        } catch (e) {
+            log("Spectrogram konnte nicht gestartet werden: " + e.message);
+        }
+
+        for (let i = 0; i < totalExamples; i++) {
+            if (i > 0) {
+                markSpectrogramBoundary(spectrogramController);
+                pulseTimelineMarker();
+            }
+
+            if (buttonEl) buttonEl.innerText = `Aufnahme läuft... (${i + 1}/${totalExamples})`;
+            statusDiv.innerText = `Nehme auf: "${labelUi}" (${i + 1}/${totalExamples})`;
+
+            await transferRecognizer.collectExample(label);
+
+            const targetMs = (i + 1) * 1000;
+            const elapsedMs = performance.now() - startedAt;
+            if (elapsedMs < targetMs) {
+                await sleep(targetMs - elapsedMs);
+            }
+        }
+
+        updateCounts();
+        statusDiv.innerText = `${labelUi} fertig (${totalExamples} Beispiele).`;
+    } catch (e) {
+        statusDiv.innerText = "Aufnahme-Fehler: " + e.message;
+    } finally {
+        await stopSpectrogram(spectrogramController);
+        spectrogramController = null;
+
+        if (recordingIntervalId) {
+            window.clearInterval(recordingIntervalId);
+            recordingIntervalId = null;
+        }
+
+        updateRecordingProgress(totalMs, totalMs);
+        recordingTime.innerText = `${totalExamples}/${totalExamples}`;
+
+        if (buttonEl && originalButtonText) buttonEl.innerText = originalButtonText;
+        recordingInProgress = false;
+        exitRecordingUiState();
+    }
+}
+
 function updateCounts() {
     // Zählt wie viele Beispiele wir für jedes Label haben
     const counts = transferRecognizer.countExamples();
@@ -405,8 +511,8 @@ function updateCounts() {
 // Event Listener für die Sammel-Buttons
 noiseBtn.addEventListener('click', () => collect(NOISE_LABEL));
 // Wir mappen die Buttons auf feste interne Label-Namen
-class1Btn.addEventListener('click', () => collect('wort1'));
-class2Btn.addEventListener('click', () => collect('wort2'));
+class1Btn.addEventListener('click', () => collectBurst('wort1', 'Wort A', 10, class1Btn));
+class2Btn.addEventListener('click', () => collectBurst('wort2', 'Wort B', 10, class2Btn));
 
 // Training starten
 trainModelBtn.addEventListener('click', async () => {
