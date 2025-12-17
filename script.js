@@ -440,6 +440,7 @@ async function collectBurst(label, labelUi, totalExamples, buttonEl) {
 
     const totalMs = totalExamples * 1000;
     const startedAt = performance.now();
+    const initialLabelCount = (transferRecognizer.countExamples()[label] || 0);
 
     recordingTitle.innerText = `Aufnahme: ${labelUi} (${totalExamples}x)`;
     recordingUi.style.display = 'block';
@@ -472,16 +473,18 @@ async function collectBurst(label, labelUi, totalExamples, buttonEl) {
                 pulseTimelineMarker();
             }
 
-            if (buttonEl) buttonEl.innerText = `Aufnahme läuft... (${i + 1}/${totalExamples})`;
-            statusDiv.innerText = `Nehme auf: "${labelUi}" (${i + 1}/${totalExamples})`;
-
-            await transferRecognizer.collectExample(label);
-
             const targetMs = (i + 1) * 1000;
+            const collectPromise = transferRecognizer.collectExample(label);
             const elapsedMs = performance.now() - startedAt;
-            if (elapsedMs < targetMs) {
-                await sleep(targetMs - elapsedMs);
-            }
+            const waitMs = Math.max(0, targetMs - elapsedMs);
+            await Promise.all([collectPromise, sleep(waitMs)]);
+
+            const labelCountNow = (transferRecognizer.countExamples()[label] || 0);
+            const collectedNow = Math.max(0, labelCountNow - initialLabelCount);
+            const shownCount = Math.min(collectedNow, totalExamples);
+
+            if (buttonEl) buttonEl.innerText = `Aufnahme läuft... (${shownCount}/${totalExamples})`;
+            statusDiv.innerText = `Nehme auf: "${labelUi}" (${shownCount}/${totalExamples})`;
         }
 
         updateCounts();
