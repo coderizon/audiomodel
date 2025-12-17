@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Android Mic Fix</title>
+    <title>Transfer Learning Fix</title>
     <link rel="stylesheet" href="style.css">
     
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
@@ -12,12 +12,28 @@
 <body>
 
     <div class="container">
-        <h1>Android Fix Test</h1>
-        <p>1. Seite neu laden.<br>2. Sofort "Start" drücken.</p>
+        <h1>Eigenes KI-Modell</h1>
+        
+        <div id="init-section">
+            <p>1. Seite neu laden.<br>2. "Start" drücken für Berechtigung.</p>
+            <button id="startBtn">Start & Erlauben</button>
+        </div>
 
-        <button id="startBtn">Start & Erlauben</button>
+        <div id="training-section" style="display: none;">
+            <p>Trainiere dein Modell:</p>
+            
+            <button id="noiseBtn" class="train-btn">1. Hintergrund aufnehmen (x10)</button>
+            <div class="spacer"></div>
+            <button id="class1Btn" class="train-btn">2. Wort A aufnehmen (x10)</button>
+            <button id="class2Btn" class="train-btn">3. Wort B aufnehmen (x10)</button>
+            
+            <div class="spacer"></div>
+            <button id="trainModelBtn" disabled>4. Training starten</button>
+            <button id="listenBtn" disabled>5. Testen (Live)</button>
+        </div>
         
         <div id="status" class="status-box">Bereit.</div>
+        <div id="console-log" style="font-size: 12px; color: #666; margin-top: 10px;"></div>
     </div>
 
     <script src="script.js"></script>
