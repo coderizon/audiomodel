@@ -396,7 +396,7 @@ trainModelBtn.addEventListener('click', async () => {
     
     try {
         await transferRecognizer.train({
-            epochs: 25,
+            epochs: 50,
             callback: {
                 onEpochEnd: async (epoch, logs) => {
                     log(`Epoch ${epoch}: loss=${logs.loss.toFixed(4)}`);
