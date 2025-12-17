@@ -35,6 +35,8 @@ let recordingInProgress = false;
 let recordingIntervalId = null;
 let spectrogramController = null;
 let uiStateBeforeRecording = null;
+let listeningInProgress = false;
+const listenBtnDefaultText = listenBtn.innerText;
 
 // Hilfsfunktion für Logs
 function log(msg) {
@@ -128,6 +130,7 @@ function updateRecordingProgress(elapsedMs, totalMs) {
 }
 
 function stopAnyLiveListening() {
+    listeningInProgress = false;
     if (!transferRecognizer) return;
     if (typeof transferRecognizer.stopListening !== 'function') return;
     try {
@@ -163,6 +166,82 @@ function amplitudeToRgb(amplitudeByte) {
     }
     const t = (v - 0.66) / 0.34;
     return [255, Math.round(t * 255), 0];
+}
+
+let modelSpectrogramBufferCanvas = null;
+let modelSpectrogramBufferCtx = null;
+let modelSpectrogramImageData = null;
+
+function drawModelSpectrogram(spectrogram) {
+    if (!spectrogramCanvas) return;
+    if (!spectrogram || !spectrogram.data || !spectrogram.frameSize) return;
+
+    const { data, frameSize } = spectrogram;
+    const numFrames = Math.floor(data.length / frameSize);
+    if (numFrames <= 0) return;
+
+    if (!modelSpectrogramBufferCanvas) {
+        modelSpectrogramBufferCanvas = document.createElement('canvas');
+        modelSpectrogramBufferCtx = modelSpectrogramBufferCanvas.getContext('2d', { alpha: false });
+    }
+    if (!modelSpectrogramBufferCtx) return;
+
+    if (
+        modelSpectrogramBufferCanvas.width !== numFrames ||
+        modelSpectrogramBufferCanvas.height !== frameSize
+    ) {
+        modelSpectrogramBufferCanvas.width = numFrames;
+        modelSpectrogramBufferCanvas.height = frameSize;
+        modelSpectrogramImageData = null;
+    }
+
+    if (
+        !modelSpectrogramImageData ||
+        modelSpectrogramImageData.width !== numFrames ||
+        modelSpectrogramImageData.height !== frameSize
+    ) {
+        modelSpectrogramImageData = modelSpectrogramBufferCtx.createImageData(numFrames, frameSize);
+    }
+
+    let min = Infinity;
+    let max = -Infinity;
+    for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+    }
+    const range = max - min || 1;
+
+    const pixels = modelSpectrogramImageData.data;
+    for (let frame = 0; frame < numFrames; frame++) {
+        const frameOffset = frame * frameSize;
+        for (let bin = 0; bin < frameSize; bin++) {
+            const v = (data[frameOffset + bin] - min) / range;
+            const amplitudeByte = Math.max(0, Math.min(255, Math.round(v * 255)));
+            const [r, g, b] = amplitudeToRgb(amplitudeByte);
+
+            const y = frameSize - 1 - bin;
+            const idx = (y * numFrames + frame) * 4;
+            pixels[idx] = r;
+            pixels[idx + 1] = g;
+            pixels[idx + 2] = b;
+            pixels[idx + 3] = 255;
+        }
+    }
+
+    modelSpectrogramBufferCtx.putImageData(modelSpectrogramImageData, 0, 0);
+
+    resizeCanvasToDisplaySize(spectrogramCanvas);
+    const canvasCtx = spectrogramCanvas.getContext('2d', { alpha: false });
+    if (!canvasCtx) return;
+    canvasCtx.imageSmoothingEnabled = false;
+    canvasCtx.drawImage(
+        modelSpectrogramBufferCanvas,
+        0,
+        0,
+        spectrogramCanvas.width,
+        spectrogramCanvas.height
+    );
 }
 
 async function startSpectrogram() {
@@ -413,10 +492,30 @@ trainModelBtn.addEventListener('click', async () => {
 
 // Live Testen
 listenBtn.addEventListener('click', () => {
+    if (!transferRecognizer) return;
+    if (recordingInProgress) return;
+
+    if (listeningInProgress) {
+        stopAnyLiveListening();
+        listenBtn.innerText = listenBtnDefaultText;
+        statusDiv.innerText = "Gestoppt.";
+        document.body.style.backgroundColor = '#fff';
+        return;
+    }
+
+    listeningInProgress = true;
+    listenBtn.innerText = "Stop";
     statusDiv.innerText = "Höre zu... Sage Wort A oder Wort B";
-    listenBtn.disabled = true; // Verhindert doppelten Klick
+
+    recordingTitle.innerText = "Live: Spektrogramm";
+    recordingUi.style.display = 'block';
+    recordingTime.innerText = "Live";
+    timelineFill.style.width = "0%";
+    timelineMarker.style.left = "0%";
 
     transferRecognizer.listen(result => {
+        drawModelSpectrogram(result.spectrogram);
+
         const scores = result.scores;
         const words = transferRecognizer.wordLabels();
         
@@ -455,6 +554,7 @@ listenBtn.addEventListener('click', () => {
 
     }, {
         probabilityThreshold: 0.75,
+        includeSpectrogram: true,
         invokeCallbackOnNoiseAndUnknown: true
     });
 });
