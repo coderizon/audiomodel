@@ -22,7 +22,18 @@
         <div id="training-section" style="display: none;">
             <p>Trainiere dein Modell:</p>
             
-            <button id="noiseBtn" class="train-btn">1. Hintergrund aufnehmen (x10)</button>
+            <button id="noiseBtn" class="train-btn">1. Hintergrund aufnehmen (20s)</button>
+            <div id="recording-ui" class="recording-ui" style="display: none;">
+                <div class="recording-header">
+                    <div id="recording-title" class="recording-title">Aufnahme</div>
+                    <div id="recording-time" class="recording-time">0 / 20s</div>
+                </div>
+                <div class="timeline" aria-label="Aufnahme Fortschritt">
+                    <div id="timeline-fill" class="timeline-fill"></div>
+                    <div id="timeline-marker" class="timeline-marker"></div>
+                </div>
+                <canvas id="spectrogram" class="spectrogram" width="640" height="200"></canvas>
+            </div>
             <div class="spacer"></div>
             <button id="class1Btn" class="train-btn">2. Wort A aufnehmen (x10)</button>
             <button id="class2Btn" class="train-btn">3. Wort B aufnehmen (x10)</button>
