@@ -28,6 +28,12 @@ let count1 = 0;
 let count2 = 0;
 
 const NOISE_LABEL = '_background_noise_';
+const MIC_AUDIO_CONSTRAINTS = {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+};
+const SPECTROGRAM_GAIN = 2.0;
 
 let recordingInProgress = false;
 let recordingIntervalId = null;
@@ -43,13 +49,21 @@ function log(msg) {
     consoleDiv.innerText = msg;
 }
 
+async function getMicrophoneStream() {
+    try {
+        return await navigator.mediaDevices.getUserMedia({ audio: MIC_AUDIO_CONSTRAINTS });
+    } catch (_) {
+        return await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+}
+
 async function app() {
     startBtn.disabled = true;
 
     // --- DEIN MIKROFON-FIX (UNVERÄNDERT) ---
     try {
         statusDiv.innerText = "Frage Mikrofon an (Android Fix)...";
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await getMicrophoneStream();
         stream.getTracks().forEach(track => track.stop()); 
         log("Mikrofon-Check erfolgreich.");
     } catch (err) {
@@ -273,15 +287,18 @@ async function startSpectrogram() {
     const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextCtor) return null;
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await getMicrophoneStream();
     const audioContext = new AudioContextCtor();
     await audioContext.resume();
 
     const source = audioContext.createMediaStreamSource(stream);
+    const gainNode = audioContext.createGain();
+    gainNode.gain.value = SPECTROGRAM_GAIN;
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 2048;
     analyser.smoothingTimeConstant = 0.65;
-    source.connect(analyser);
+    source.connect(gainNode);
+    gainNode.connect(analyser);
 
     const frequencyData = new Uint8Array(analyser.frequencyBinCount);
     const column = canvasCtx.createImageData(1, spectrogramCanvas.height);
@@ -289,6 +306,7 @@ async function startSpectrogram() {
     const controller = {
         stream,
         audioContext,
+        gainNode,
         analyser,
         frequencyData,
         canvasCtx,
