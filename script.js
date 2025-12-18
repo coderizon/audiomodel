@@ -34,6 +34,8 @@ const MIC_AUDIO_CONSTRAINTS = {
     autoGainControl: false,
 };
 const SPECTROGRAM_GAIN = 2.5;
+const TARGET_EXAMPLES_PER_LABEL = 10;
+const COLLECT_EXAMPLE_TIMEOUT_MS = 8000;
 
 const nativeGetUserMedia =
     navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function'
@@ -48,11 +50,85 @@ let uiStateBeforeRecording = null;
 let listeningInProgress = false;
 const listenBtnDefaultText = listenBtn.innerText;
 
+let sharedRawMicStream = null;
+let sharedRawMicStreamPromise = null;
+let sharedRawMicLeases = 0;
+let sharedRawMicStopTimeoutId = null;
+let sharedPreampContext = null;
+
 // Hilfsfunktion für Logs
 function log(msg) {
     console.log(msg);
     // Optional: Log auch auf dem Schirm anzeigen für Mobile Debugging
     consoleDiv.innerText = msg;
+}
+
+function supportsStreamCloning() {
+    return typeof MediaStream !== 'undefined' && typeof MediaStream.prototype.clone === 'function';
+}
+
+function stopSharedRawMicStream() {
+    if (sharedRawMicStopTimeoutId) {
+        window.clearTimeout(sharedRawMicStopTimeoutId);
+        sharedRawMicStopTimeoutId = null;
+    }
+    if (!sharedRawMicStream) return;
+    try {
+        sharedRawMicStream.getTracks().forEach(track => track.stop());
+    } catch (_) {
+        // ignore
+    }
+    sharedRawMicStream = null;
+}
+
+function scheduleStopSharedRawMicStream() {
+    if (sharedRawMicLeases > 0) return;
+    if (sharedRawMicStopTimeoutId) window.clearTimeout(sharedRawMicStopTimeoutId);
+    sharedRawMicStopTimeoutId = window.setTimeout(() => {
+        sharedRawMicStopTimeoutId = null;
+        if (sharedRawMicLeases === 0) stopSharedRawMicStream();
+    }, 4000);
+}
+
+async function getOrCreateSharedRawMicStream(audioConstraints) {
+    if (sharedRawMicStream) {
+        const hasLiveTrack = sharedRawMicStream.getTracks().some(track => track.readyState === 'live');
+        if (hasLiveTrack) return sharedRawMicStream;
+        stopSharedRawMicStream();
+    }
+
+    if (sharedRawMicStreamPromise) return sharedRawMicStreamPromise;
+    sharedRawMicStreamPromise = nativeGetUserMedia({ audio: audioConstraints })
+        .then(stream => {
+            sharedRawMicStream = stream;
+            return stream;
+        })
+        .finally(() => {
+            sharedRawMicStreamPromise = null;
+        });
+    return sharedRawMicStreamPromise;
+}
+
+function acquireSharedRawMicClone(stream) {
+    sharedRawMicLeases += 1;
+    if (sharedRawMicStopTimeoutId) {
+        window.clearTimeout(sharedRawMicStopTimeoutId);
+        sharedRawMicStopTimeoutId = null;
+    }
+
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        sharedRawMicLeases = Math.max(0, sharedRawMicLeases - 1);
+        scheduleStopSharedRawMicStream();
+    };
+
+    stream.getTracks().forEach(track => {
+        track.addEventListener('ended', release, { once: true });
+    });
+
+    return release;
 }
 
 async function getMicrophoneStream() {
@@ -68,7 +144,7 @@ function patchGetUserMediaForRawAudio() {
     if (!nativeGetUserMedia || !navigator.mediaDevices) return;
 
     navigator.mediaDevices.getUserMedia = async (constraints = {}) => {
-        if (!constraints || !constraints.audio) {
+        if (!constraints || !constraints.audio || constraints.video) {
             return nativeGetUserMedia(constraints);
         }
 
@@ -96,39 +172,39 @@ function patchGetUserMediaForRawAudio() {
 
         const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
         const canApplyGain = shouldApplySoftwareGain && AudioContextCtor;
-        const preampContext = canApplyGain ? new AudioContextCtor() : null;
-        const preampResumePromise = preampContext && preampContext.state === 'suspended'
-            ? preampContext.resume().catch(() => {})
-            : Promise.resolve();
+        const canShareStream = supportsStreamCloning();
 
         let rawStream;
         try {
-            rawStream = await nativeGetUserMedia(mergedConstraints);
-        } catch (_) {
-            if (preampContext) {
-                try {
-                    await preampContext.close();
-                } catch (_) {
-                    // ignore
-                }
+            if (canShareStream) {
+                const sharedStream = await getOrCreateSharedRawMicStream(mergedConstraints.audio);
+                rawStream = sharedStream.clone();
+                acquireSharedRawMicClone(rawStream);
+            } else {
+                rawStream = await nativeGetUserMedia(mergedConstraints);
             }
+        } catch (_) {
             return nativeGetUserMedia(constraints);
         }
 
-        if (!preampContext) return rawStream;
-        await preampResumePromise;
+        if (!canApplyGain) return rawStream;
 
-        const source = preampContext.createMediaStreamSource(rawStream);
-        const gainNode = preampContext.createGain();
+        if (!sharedPreampContext) {
+            sharedPreampContext = new AudioContextCtor();
+        }
+        await resumeAudioContextIfSuspended(sharedPreampContext);
+
+        const source = sharedPreampContext.createMediaStreamSource(rawStream);
+        const gainNode = sharedPreampContext.createGain();
         gainNode.gain.value = SPECTROGRAM_GAIN;
-        const destination = preampContext.createMediaStreamDestination();
+        const destination = sharedPreampContext.createMediaStreamDestination();
 
         source.connect(gainNode);
         gainNode.connect(destination);
 
         const boostedStream = destination.stream;
         let cleanedUp = false;
-        const cleanup = async () => {
+        const cleanup = () => {
             if (cleanedUp) return;
             cleanedUp = true;
 
@@ -139,7 +215,8 @@ function patchGetUserMediaForRawAudio() {
             }
 
             try {
-                await preampContext.close();
+                source.disconnect();
+                gainNode.disconnect();
             } catch (_) {
                 // ignore
             }
@@ -311,7 +388,7 @@ function stopAnyLiveListening() {
 
 function resizeCanvasToDisplaySize(canvas) {
     const rect = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
     const displayWidth = Math.max(1, Math.floor(rect.width * dpr));
     const displayHeight = Math.max(1, Math.floor(rect.height * dpr));
 
@@ -472,10 +549,20 @@ async function startSpectrogram() {
         rafId: null,
         boundaryFramesLeft: 0,
         running: true,
+        lastDrawTime: 0,
     };
 
-    const draw = () => {
+    const draw = (now) => {
         if (!controller.running) return;
+
+        if (now && controller.lastDrawTime) {
+            const dt = now - controller.lastDrawTime;
+            if (dt < 33) {
+                controller.rafId = requestAnimationFrame(draw);
+                return;
+            }
+        }
+        controller.lastDrawTime = now || performance.now();
 
         analyser.getByteFrequencyData(frequencyData);
         canvasCtx.drawImage(spectrogramCanvas, -1, 0);
@@ -534,6 +621,42 @@ async function stopSpectrogram(controller) {
     }
 }
 
+async function ensureSpeechCommandsAudioRunning() {
+    await resumeAudioContextIfSuspended(getSpeechCommandsAudioContext(baseRecognizer));
+    await resumeAudioContextIfSuspended(getSpeechCommandsAudioContext(transferRecognizer));
+}
+
+async function collectExampleWithTimeout(label, timeoutMs = COLLECT_EXAMPLE_TIMEOUT_MS) {
+    if (!transferRecognizer) throw new Error('Transfer recognizer nicht initialisiert.');
+    await ensureSpeechCommandsAudioRunning();
+    try {
+        if (typeof transferRecognizer.stopListening === 'function') transferRecognizer.stopListening();
+    } catch (_) {
+        // ignore
+    }
+
+    const collectPromise = transferRecognizer.collectExample(label);
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = window.setTimeout(() => {
+            reject(new Error(`Aufnahme hängt (Timeout nach ${Math.round(timeoutMs / 1000)}s).`));
+        }, timeoutMs);
+    });
+
+    try {
+        return await Promise.race([collectPromise, timeoutPromise]);
+    } catch (err) {
+        try {
+            if (typeof transferRecognizer.stopListening === 'function') transferRecognizer.stopListening();
+        } catch (_) {
+            // ignore
+        }
+        throw err;
+    } finally {
+        if (timeoutId) window.clearTimeout(timeoutId);
+    }
+}
+
 // Funktion um Beispiele zu sammeln
 async function collect(label) {
     if (!transferRecognizer) return;
@@ -568,7 +691,7 @@ async function collect(label) {
         }
 
         statusDiv.innerText = `Nehme auf: "${labelUi}"...`;
-        await transferRecognizer.collectExample(label);
+        await collectExampleWithTimeout(label);
 
         statusDiv.innerText = `Gespeichert: "${labelUi}"`;
         updateCounts();
@@ -591,6 +714,7 @@ async function collect(label) {
 async function collectBurst(label, labelUi, totalExamples, buttonEl) {
     if (!transferRecognizer) return;
     if (recordingInProgress) return;
+    if (!Number.isFinite(totalExamples) || totalExamples <= 0) return;
 
     recordingInProgress = true;
     stopAnyLiveListening();
@@ -632,7 +756,7 @@ async function collectBurst(label, labelUi, totalExamples, buttonEl) {
             }
 
             const targetMs = (i + 1) * 1000;
-            const collectPromise = transferRecognizer.collectExample(label);
+            const collectPromise = collectExampleWithTimeout(label);
             const elapsedMs = performance.now() - startedAt;
             const waitMs = Math.max(0, targetMs - elapsedMs);
             await Promise.all([collectPromise, sleep(waitMs)]);
@@ -687,11 +811,22 @@ function updateCounts() {
     }
 }
 
+function collectUntilTarget(label, labelUi, targetTotal, buttonEl) {
+    if (!transferRecognizer) return;
+    const current = (transferRecognizer.countExamples()[label] || 0);
+    const remaining = Math.max(0, targetTotal - current);
+    if (remaining <= 0) {
+        statusDiv.innerText = `${labelUi}: schon ${targetTotal} Beispiele vorhanden.`;
+        return;
+    }
+    return collectBurst(label, labelUi, remaining, buttonEl);
+}
+
 // Event Listener für die Sammel-Buttons
 noiseBtn.addEventListener('click', () => collect(NOISE_LABEL));
 // Wir mappen die Buttons auf feste interne Label-Namen
-class1Btn.addEventListener('click', () => collectBurst('wort1', 'Wort A', 10, class1Btn));
-class2Btn.addEventListener('click', () => collectBurst('wort2', 'Wort B', 10, class2Btn));
+class1Btn.addEventListener('click', () => collectUntilTarget('wort1', 'Wort A', TARGET_EXAMPLES_PER_LABEL, class1Btn));
+class2Btn.addEventListener('click', () => collectUntilTarget('wort2', 'Wort B', TARGET_EXAMPLES_PER_LABEL, class2Btn));
 
 // Training starten
 trainModelBtn.addEventListener('click', async () => {
@@ -785,3 +920,7 @@ listenBtn.addEventListener('click', () => {
 });
 
 startBtn.addEventListener('click', app);
+
+window.addEventListener('pagehide', () => {
+    stopSharedRawMicStream();
+});
